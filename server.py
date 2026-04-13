@@ -78,10 +78,10 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 COVAL_API_KEY = os.environ.get("COVAL_API_KEY", "")
 COVAL_SIMULATION_ID_OVERRIDE = os.environ.get("COVAL_SIMULATION_ID", "")
 
-_COVAL_BASE = os.environ.get("COVAL_API_BASE_URL", "https://api.coval.dev")
-COVAL_TRACES_URL = f"{_COVAL_BASE}/v1/traces"
-COVAL_SUBMIT_URL = f"{_COVAL_BASE}/v1/conversations:submit"
-COVAL_CONVERSATIONS_URL = f"{_COVAL_BASE}/v1/conversations"
+_COVAL_BASE = os.environ.get("COVAL_API_BASE_URL", "https://api.coval.dev/v1")
+COVAL_TRACES_URL = f"{_COVAL_BASE}/traces"
+COVAL_SUBMIT_URL = f"{_COVAL_BASE}/conversations:submit"
+COVAL_CONVERSATIONS_URL = f"{_COVAL_BASE}/conversations"
 SERVICE_NAME = "twilio-voice-agent"
 LLM_MODEL = "gpt-4o-mini"
 
