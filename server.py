@@ -7,12 +7,12 @@ Architecture
 ────────────
   Phone call → POST /webhook → TwiML with ConversationRelay
   → WebSocket /ws ← Twilio connects
-  → "setup" event (callSid) → map to pending simulation ID
+  → "setup" event (callSid) → map to pending simulation ID (or submit conversation)
   → "prompt" events (Twilio STT) → OpenAI streaming → text tokens back
   → WebSocket close → build OTel spans → POST /v1/traces
 
-Simulation correlation
-──────────────────────
+Simulation mode (default — no COVAL_AGENT_ID set)
+──────────────────────────────────────────────────
   Twilio Programmable Voice routes calls over PSTN, which strips custom SIP
   headers. X-Coval-Simulation-Id therefore never reaches this agent. To
   correlate traces, pre-seed the simulation ID before Coval places the call:
@@ -23,6 +23,17 @@ Simulation correlation
 
   IDs are queued FIFO and consumed when the next call arrives. The static env
   var COVAL_SIMULATION_ID is available as a fallback for manual one-off testing.
+
+Monitoring mode (set COVAL_AGENT_ID to enable)
+───────────────────────────────────────────────
+  For live production calls evaluated via the Conversations API. At call end:
+    1. POST /v1/conversations:submit with the transcript → get conversation_id
+    2. Export OTel spans with X-Conversation-Id
+    3. PATCH /v1/conversations/{id} with audio_url after COVAL_AUDIO_DELAY_SECONDS
+
+  Audio options:
+    a) Set COVAL_TEST_AUDIO_URL for a fixed URL (all calls, scheduled after delay)
+    b) Wire Twilio Recording Status Callback to POST /recording-status (real URLs)
 
 Run locally
 ───────────
@@ -67,9 +78,30 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 COVAL_API_KEY = os.environ.get("COVAL_API_KEY", "")
 COVAL_SIMULATION_ID_OVERRIDE = os.environ.get("COVAL_SIMULATION_ID", "")
 
-COVAL_TRACES_URL = "https://api.coval.dev/v1/traces"
+_COVAL_BASE = os.environ.get("COVAL_API_BASE_URL", "https://api.coval.dev")
+COVAL_TRACES_URL = f"{_COVAL_BASE}/v1/traces"
+COVAL_SUBMIT_URL = f"{_COVAL_BASE}/v1/conversations:submit"
+COVAL_CONVERSATIONS_URL = f"{_COVAL_BASE}/v1/conversations"
 SERVICE_NAME = "twilio-voice-agent"
 LLM_MODEL = "gpt-4o-mini"
+
+# ── Monitoring mode (set COVAL_AGENT_ID to enable) ────────────────────────────
+# When COVAL_AGENT_ID is set, the agent uses the Conversations API instead of
+# the simulation trace path:
+#   1. POST /v1/conversations:submit (transcript only) at call end
+#   2. Export OTel spans with X-Conversation-Id
+#   3. PATCH /v1/conversations/{id} with audio_url after COVAL_AUDIO_DELAY_SECONDS
+#
+# For the PATCH step, two options:
+#   a) Set COVAL_TEST_AUDIO_URL to a fixed audio URL to use for all calls.
+#   b) POST to /recording-status with {"call_sid": "...", "recording_url": "..."}
+#      (wire Twilio's Recording Status Callback to this endpoint).
+#
+# If neither is configured, audio is not attached (text metrics still fire).
+
+COVAL_AGENT_ID = os.environ.get("COVAL_AGENT_ID", "")
+COVAL_TEST_AUDIO_URL = os.environ.get("COVAL_TEST_AUDIO_URL", "")
+COVAL_AUDIO_DELAY_SECONDS = float(os.environ.get("COVAL_AUDIO_DELAY_SECONDS", "60"))
 
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
@@ -79,6 +111,9 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # Consumed FIFO when a call arrives. Entries expire after 5 minutes.
 _pending_sim_ids: deque[tuple[str, float]] = deque()
 _SIM_ID_TTL_SECONDS = 300
+
+# call_sid → conversation_id; populated in monitoring mode after submit
+_pending_audio_patches: dict[str, str] = {}
 
 
 def _pop_pending_sim_id() -> Optional[str]:
@@ -300,6 +335,123 @@ def _send_spans(spans: list[dict], simulation_id: str) -> None:
             logger.error(f"Coval trace export failed {resp.status_code}: {resp.text}")
     except Exception as exc:
         logger.error(f"Coval trace export exception: {exc}")
+
+
+def _send_spans_for_conversation(spans: list[dict], conversation_id: str) -> None:
+    """Export OTel spans correlated to a Conversations API conversation_id."""
+    payload = {
+        "resourceSpans": [
+            {
+                "resource": {
+                    "attributes": [
+                        {"key": "service.name", "value": {"stringValue": SERVICE_NAME}}
+                    ]
+                },
+                "scopeSpans": [
+                    {
+                        "scope": {"name": SERVICE_NAME},
+                        "spans": spans,
+                    }
+                ],
+            }
+        ]
+    }
+    try:
+        resp = httpx.post(
+            COVAL_TRACES_URL,
+            json=payload,
+            headers={"x-api-key": COVAL_API_KEY, "X-Conversation-Id": conversation_id},
+            timeout=30,
+        )
+        if resp.is_success:
+            logger.info(f"Exported {len(spans)} spans for conversation {conversation_id}")
+        else:
+            logger.error(f"Coval trace export failed {resp.status_code}: {resp.text}")
+    except Exception as exc:
+        logger.error(f"Coval trace export exception: {exc}")
+
+
+def _build_transcript(turns: list, call_start_epoch_seconds: float) -> list[dict]:
+    """Build a Coval transcript from the turn log, including only user/assistant turns."""
+    transcript = []
+    for index, turn in enumerate(turns):
+        if turn.role not in ("user", "assistant"):
+            continue
+        # Estimate end_time as the start of the next turn (or start + 2s as fallback)
+        next_turn = next(
+            (t for t in turns[index + 1:] if t.role in ("user", "assistant")), None
+        )
+        end_time = next_turn.seconds_from_start if next_turn else turn.seconds_from_start + 2.0
+        transcript.append({
+            "role": turn.role,
+            "content": turn.content,
+            "start_time": round(turn.seconds_from_start, 3),
+            "end_time": round(end_time, 3),
+        })
+    return transcript
+
+
+def _submit_conversation(
+    turns: list,
+    call_start_epoch_seconds: float,
+    call_sid: str,
+) -> Optional[str]:
+    """POST /v1/conversations:submit and return the conversation_id, or None on failure."""
+    transcript = _build_transcript(turns, call_start_epoch_seconds)
+    if not transcript:
+        logger.warning(f"No transcript for callSid={call_sid}; skipping submit")
+        return None
+
+    body: dict = {
+        "transcript": transcript,
+        "agent_id": COVAL_AGENT_ID,
+        "external_conversation_id": call_sid,
+    }
+
+    try:
+        resp = httpx.post(
+            COVAL_SUBMIT_URL,
+            json=body,
+            headers={"x-api-key": COVAL_API_KEY, "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.is_success:
+            conversation_id = resp.json()["conversation"]["conversation_id"]
+            logger.info(f"Submitted conversation for callSid={call_sid} → conversation_id={conversation_id}")
+            return conversation_id
+        else:
+            logger.error(f"conversations:submit failed {resp.status_code}: {resp.text}")
+            return None
+    except Exception as exc:
+        logger.error(f"conversations:submit exception: {exc}")
+        return None
+
+
+def _patch_conversation_audio(conversation_id: str, audio_url: str) -> None:
+    """PATCH /v1/conversations/{conversation_id} with an audio_url."""
+    try:
+        resp = httpx.patch(
+            f"{COVAL_CONVERSATIONS_URL}/{conversation_id}",
+            json={"audio_url": audio_url},
+            headers={"x-api-key": COVAL_API_KEY, "Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.is_success:
+            logger.info(f"Attached audio to conversation {conversation_id}")
+        else:
+            logger.error(f"PATCH conversation failed {resp.status_code}: {resp.text}")
+    except Exception as exc:
+        logger.error(f"PATCH conversation exception: {exc}")
+
+
+async def _schedule_audio_patch(conversation_id: str, audio_url: str) -> None:
+    """Wait COVAL_AUDIO_DELAY_SECONDS then attach audio — simulates async recording."""
+    delay = COVAL_AUDIO_DELAY_SECONDS
+    logger.info(
+        f"Scheduling audio PATCH for conversation {conversation_id} in {delay:.0f}s"
+    )
+    await asyncio.sleep(delay)
+    _patch_conversation_audio(conversation_id, audio_url)
 
 
 # ── Per-turn log ──────────────────────────────────────────────────────────────
@@ -709,12 +861,32 @@ async def conversationrelay_websocket(websocket: WebSocket):
             except (asyncio.CancelledError, Exception):
                 pass
 
-        if simulation_id and COVAL_API_KEY and turns:
-            call_duration_seconds = time.time() - call_start_epoch_seconds
+        call_duration_seconds = time.time() - call_start_epoch_seconds
+
+        if COVAL_AGENT_ID and COVAL_API_KEY and turns:
+            # ── Monitoring mode: submit transcript → export spans → schedule audio PATCH ──
+            conversation_id = _submit_conversation(turns, call_start_epoch_seconds, call_sid or "")
+            if conversation_id:
+                spans = _build_spans_from_turns(turns, call_start_epoch_seconds, call_duration_seconds)
+                logger.info(
+                    f"Exporting {len(spans)} spans from {len(turns)} turns for conversation {conversation_id}"
+                )
+                _send_spans_for_conversation(spans, conversation_id)
+                if COVAL_TEST_AUDIO_URL:
+                    asyncio.create_task(_schedule_audio_patch(conversation_id, COVAL_TEST_AUDIO_URL))
+                elif call_sid:
+                    # Store for manual /recording-status trigger
+                    _pending_audio_patches[call_sid] = conversation_id
+                    logger.info(
+                        f"No COVAL_TEST_AUDIO_URL set — POST /recording-status with "
+                        f'{{"call_sid": "{call_sid}", "recording_url": "..."}} to attach audio'
+                    )
+        elif simulation_id and COVAL_API_KEY and turns:
+            # ── Simulation mode (default) ──────────────────────────────────────
             spans = _build_spans_from_turns(turns, call_start_epoch_seconds, call_duration_seconds)
             logger.info(f"Exporting {len(spans)} spans from {len(turns)} turns for sim {simulation_id}")
             _send_spans(spans, simulation_id)
-        elif not simulation_id:
+        elif not COVAL_AGENT_ID and not simulation_id:
             logger.warning(
                 f"No sim_id for callSid={call_sid} — skipping trace export. "
                 "Use POST /register-simulation before placing the call, or set COVAL_SIMULATION_ID."
@@ -778,6 +950,53 @@ async def register_simulation(
         f"(queue depth: {len(_pending_sim_ids)})"
     )
     return JSONResponse({"status": "ok", "queued": len(_pending_sim_ids)})
+
+
+@app.post("/recording-status")
+async def recording_status(
+    request: Request,
+    x_api_key: str = Header(default=""),
+):
+    """Attach audio to a conversation once the recording URL is available.
+
+    Call this after Twilio finalizes a recording, or wire it to Twilio's
+    Recording Status Callback URL in your Twilio number config.
+
+    Example (manual trigger):
+        curl -X POST https://coval-twilio-agent.fly.dev/recording-status \\
+          -H "x-api-key: <COVAL_API_KEY>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"call_sid": "CAxxxxx", "recording_url": "https://..."}'
+
+    Twilio recording-status callback sends form-encoded fields including
+    RecordingSid, RecordingUrl, CallSid — this endpoint accepts both.
+    """
+    if not COVAL_API_KEY or x_api_key != COVAL_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+        call_sid = body.get("call_sid", "")
+        recording_url = body.get("recording_url", "")
+    else:
+        # Twilio sends form-encoded recording status callbacks
+        form = await request.form()
+        call_sid = str(form.get("CallSid", ""))
+        recording_url = str(form.get("RecordingUrl", ""))
+        if recording_url and not recording_url.endswith(".wav"):
+            recording_url += ".wav"
+
+    if not call_sid or not recording_url:
+        raise HTTPException(status_code=400, detail="call_sid and recording_url are required")
+
+    conversation_id = _pending_audio_patches.pop(call_sid, None)
+    if not conversation_id:
+        logger.warning(f"No pending conversation for callSid={call_sid}")
+        return JSONResponse({"status": "no_pending_conversation", "call_sid": call_sid})
+
+    _patch_conversation_audio(conversation_id, recording_url)
+    return JSONResponse({"status": "ok", "conversation_id": conversation_id})
 
 
 @app.get("/health")
